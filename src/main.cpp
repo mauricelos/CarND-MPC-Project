@@ -12,6 +12,10 @@
 // for convenience
 using json = nlohmann::json;
 
+//latency and Lf for latency correction
+double latency = 0.1;
+const double Lf = 2.67;
+
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
@@ -42,6 +46,8 @@ double polyeval(Eigen::VectorXd coeffs, double x) {
 }
 
 // Fit a polynomial.
+// Adapted from
+// https://github.com/JuliaMath/Polynomials.jl/blob/master/src/Polynomials.jl#L676-L716
 Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
                         int order) {
   assert(xvals.size() == yvals.size());
@@ -85,23 +91,106 @@ int main() {
           // j[1] is the data JSON object
           vector<double> ptsx = j[1]["ptsx"];
           vector<double> ptsy = j[1]["ptsy"];
+          double steer_value = j[1]["steering_angle"];
+          double throttle_value = j[1]["throttle"];
           double px = j[1]["x"];
           double py = j[1]["y"];
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
 
-          /*
-          * TODO: Calculate steeering angle and throttle using MPC.
-          *
-          * Both are in between [-1, 1].
-          *
-          */
-          double steer_value;
-          double throttle_value;
+          for (int i = 0; i < ptsx.size(); i++ ) {
+              
+              //using the car's coordinates and orientation as orgin of a new coordinate system
+              double new_ptsx = ptsx[i]-px;
+              double new_ptsy = ptsy[i]-py;
+              double cos_psi = cos(psi);
+              double sin_psi = sin(psi);
+              
+              ptsx[i] = new_ptsx*cos_psi + new_ptsy*sin_psi;
+              ptsy[i] = new_ptsy*cos_psi - new_ptsx*sin_psi;
+          }
+            
+          //converting all observed waypoints to Eigen::VectorXd
+          Eigen::VectorXd ptsx2(6);
+          Eigen::VectorXd ptsy2(6);
+          ptsx2 << ptsx[0], ptsx[1], ptsx[2], ptsx[3], ptsx[4], ptsx[5];
+          ptsy2 << ptsy[0], ptsy[1], ptsy[2], ptsy[3], ptsy[4], ptsy[5];
+            
+          //calculating coeffs, cte and epsi and adding latency corrections to all values
+          px = v*latency;
+          py = 0;
+          psi = -v*steer_value/Lf*latency;
+          v += throttle_value*latency;
+          auto coeffs = polyfit(ptsx2, ptsy2, 3);
+          double cte = polyeval(coeffs, px);
+          double epsi = psi -atan(coeffs[1] + 2*coeffs[2]*px + 3*coeffs[3]*px*px);
+            
+          
+          Eigen::VectorXd state(6);
+          state << px, py, psi, v, cte, epsi;
+            
+          //sending state and coeffs to mpc.Solve
+          auto vars = mpc.Solve(state, coeffs);
 
           json msgJson;
-          msgJson["steering_angle"] = steer_value;
-          msgJson["throttle"] = throttle_value;
+          msgJson["steering_angle"] = -vars[4];
+          msgJson["throttle"] = vars[5];
+
+          //Display the MPC predicted trajectory 
+          vector<double> mpc_x_vals;
+          vector<double> mpc_y_vals;
+          vector<double> mpc_x_vals_;
+          vector<double> mpc_y_vals_;
+
+          //adding every even index value (above vars[5]) to mpc_x_vals and every odd index value to mpc_y_vals
+          for (int i = 6; i < vars.size(); i++) {
+              
+              if ((i & 1) == 0) {
+                 
+                  mpc_x_vals.push_back(vars[i]);
+              }
+              else {
+                  
+                  mpc_y_vals.push_back(vars[i]);
+              }
+          }
+
+          //converting normal vector to Eigen::VectorXd to calculate coeffs
+          Eigen::VectorXd mpc_x_values = Eigen::VectorXd::Map(mpc_x_vals.data(), mpc_x_vals.size());
+          Eigen::VectorXd mpc_y_values = Eigen::VectorXd::Map(mpc_y_vals.data(), mpc_y_vals.size());
+          auto mpc_coeffs = polyfit(mpc_x_values, mpc_y_values, 3);
+            
+          //calculating points with the coeffs and set x values using polyeval
+          for (int i = 1; i < 20; i++) {
+                
+              int x_value = 2*i;
+              double y_value = polyeval(mpc_coeffs, x_value);
+                
+              mpc_x_vals_.push_back(x_value);
+              mpc_y_vals_.push_back(y_value);
+          }
+            
+          msgJson["mpc_x"] = mpc_x_vals_;
+          msgJson["mpc_y"] = mpc_y_vals_;
+
+          //Display the waypoints/reference line
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
+            
+          //calculating points with the coeffs and set x values using polyeval
+          for (int i = -3; i < 40; i++) {
+              
+              int x_value = 2*i;
+              double y_value = polyeval(coeffs, x_value);
+              
+              next_x_vals.push_back(x_value);
+              next_y_vals.push_back(y_value);
+          }
+
+          msgJson["next_x"] = next_x_vals;
+          msgJson["next_y"] = next_y_vals;
+
+
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
           std::cout << msg << std::endl;
           // Latency
@@ -110,6 +199,9 @@ int main() {
           //
           // Feel free to play around with this value but should be to drive
           // around the track with 100ms latency.
+          //
+          // NOTE: REMEMBER TO SET THIS TO 100 MILLISECONDS BEFORE
+          // SUBMITTING.
           this_thread::sleep_for(chrono::milliseconds(100));
           ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }
